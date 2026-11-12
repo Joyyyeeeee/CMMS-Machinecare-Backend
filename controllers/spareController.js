@@ -189,6 +189,9 @@ exports.createSpare = asyncHandler(async (req, res) => {
 
 async function seedInitialDataIfEmpty() {
     try {
+        const shouldSeedDemoData = process.env.SEED_DEMO_DATA === 'true';
+        if (!shouldSeedDemoData) return;
+
         const count = await Spare.countDocuments();
         if (count > 0) return;
 
