@@ -60,10 +60,9 @@ const authorize = (...roles) => {
   };
 };
 
-module.exports = {
-  protect,
-  authorize,
-  // Aliases for compatibility across route files
-  authMiddleware: protect,
-  authorizeRoles: authorize
-};
+protect.protect = protect;
+protect.authorize = authorize;
+protect.authMiddleware = protect;
+protect.authorizeRoles = authorize;
+
+module.exports = protect;

@@ -9,6 +9,8 @@ const machineRoutes = require("./routes/machineRoutes");
 const authRoutes = require("./routes/authRoutes");
 const sparePartRoutes = require("./routes/sparePartRoutes");
 const spareRoutes = require("./routes/spareRoutes");
+const employeesRoutes = require("./routes/employeesRoutes");
+const alertsRoutes = require("./routes/alertsRoutes");
 const errorHandler = require("./middleware/errorHandler");
 
 const app = express();
@@ -25,7 +27,8 @@ app.use("/api/auth", authRoutes);
 app.use("/api/machines", machineRoutes);
 app.use("/api/spare-parts", sparePartRoutes);
 app.use("/api/spares", spareRoutes);
-
+app.use("/api/employees", employeesRoutes);
+app.use("/api/alerts", alertsRoutes);
 // Centralized error handler
 app.use(errorHandler);
 const PORT = process.env.PORT || 5000;

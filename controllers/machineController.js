@@ -1,7 +1,33 @@
 const Machine = require("../models/Machine");
 const MachineSpare = require("../models/MachineSpare");
 const Spare = require("../models/Spare");
+const Employee = require("../models/employeesModel");
 const mongoose = require("mongoose");
+
+const validateAssignedEmployees = async (employeeIds) => {
+    if (!Array.isArray(employeeIds)) {
+        return { error: "Assigned employees must be provided as a list" };
+    }
+
+    const uniqueIds = [...new Set(employeeIds.map(String))];
+    if (uniqueIds.some((id) => !mongoose.isValidObjectId(id))) {
+        return { error: "One or more selected employees are invalid" };
+    }
+
+    const activeEmployees = await Employee.countDocuments({
+        _id: { $in: uniqueIds },
+        status: "Active"
+    });
+
+    if (activeEmployees !== uniqueIds.length) {
+        return { error: "One or more selected employees are no longer active" };
+    }
+
+    return { employeeIds: uniqueIds };
+};
+
+const populateAssignedEmployees = (query) =>
+    query.populate("assignedEmployees", "employeeId name designation status");
 
 const validateSpareIds = async (spareIds) => {
     if (!Array.isArray(spareIds)) {
@@ -44,7 +70,15 @@ const syncMachineSpares = async (machineId, spareIds) => {
 // POST - Add Machine
 exports.createMachine = async (req, res) => {
     try {
-        const { code, name, location, status, spares, handledBy, spareIds } = req.body;
+        const {
+            code,
+            name,
+            location,
+            status,
+            spares,
+            spareIds,
+            assignedEmployees = []
+        } = req.body;
 
         if (!code || !name || !location) {
             return res.status(400).json({
@@ -65,19 +99,29 @@ exports.createMachine = async (req, res) => {
             selectedSpareIds = validated.spareIds;
         }
 
+        const validatedEmployees = await validateAssignedEmployees(assignedEmployees);
+        if (validatedEmployees.error) {
+            return res.status(400).json({
+                success: false,
+                message: validatedEmployees.error
+            });
+        }
+
         const machine = await Machine.create({
             code,
             name,
             location,
             status,
             spares: selectedSpareIds ? selectedSpareIds.length : spares,
-            handledBy
+            handledBy: [],
+            assignedEmployees: validatedEmployees.employeeIds
         });
 
         if (selectedSpareIds) {
             await syncMachineSpares(machine._id, selectedSpareIds);
         }
 
+        await populateAssignedEmployees(machine);
         res.status(201).json({
             success: true,
             message: "Machine added successfully",
@@ -98,7 +142,9 @@ exports.createMachine = async (req, res) => {
 // GET - Get All Machines
 exports.getAllMachines = async (req, res) => {
     try {
-        const machines = await Machine.find().sort({ createdAt: -1 });
+        const machines = await populateAssignedEmployees(
+            Machine.find().sort({ createdAt: -1 })
+        );
 
         res.status(200).json({
             success: true,
@@ -118,7 +164,9 @@ exports.getAllMachines = async (req, res) => {
 // GET - Get Machine By ID
 exports.getMachineById = async (req, res) => {
     try {
-        const machine = await Machine.findById(req.params.id);
+        const machine = await populateAssignedEmployees(
+            Machine.findById(req.params.id)
+        );
 
         if (!machine) {
             return res.status(404).json({
@@ -149,8 +197,7 @@ exports.updateMachine = async (req, res) => {
             "name",
             "location",
             "status",
-            "spares",
-            "handledBy"
+            "spares"
         ];
 
         let selectedSpareIds;
@@ -165,6 +212,18 @@ exports.updateMachine = async (req, res) => {
             selectedSpareIds = validated.spareIds;
         }
 
+        let selectedEmployeeIds;
+        if (req.body.assignedEmployees !== undefined) {
+            const validated = await validateAssignedEmployees(req.body.assignedEmployees);
+            if (validated.error) {
+                return res.status(400).json({
+                    success: false,
+                    message: validated.error
+                });
+            }
+            selectedEmployeeIds = validated.employeeIds;
+        }
+
         const updates = {};
 
         allowedFields.forEach(field => {
@@ -175,6 +234,10 @@ exports.updateMachine = async (req, res) => {
 
         if (selectedSpareIds) {
             updates.spares = selectedSpareIds.length;
+        }
+        if (selectedEmployeeIds) {
+            updates.assignedEmployees = selectedEmployeeIds;
+            updates.handledBy = [];
         }
 
         const machine = await Machine.findById(req.params.id);
@@ -193,6 +256,7 @@ exports.updateMachine = async (req, res) => {
             await syncMachineSpares(machine._id, selectedSpareIds);
         }
 
+        await populateAssignedEmployees(machine);
         res.status(200).json({
             success: true,
             message: "Machine updated successfully",
