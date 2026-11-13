@@ -37,6 +37,11 @@ const machineSchema = new mongoose.Schema({
     handledBy: [{
         type: String,
         trim: true
+    }],
+
+    assignedEmployees: [{
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "Employee"
     }]
 
 }, { timestamps: true });
