@@ -25,11 +25,6 @@ const validateSpareIds = async (spareIds) => {
 };
 
 const syncMachineSpares = async (machineId, spareIds) => {
-    await MachineSpare.deleteMany({
-        machine: machineId,
-        spare: { $nin: spareIds }
-    });
-
     if (spareIds.length) {
         await MachineSpare.bulkWrite(spareIds.map((spareId) => ({
             updateOne: {
@@ -39,7 +34,20 @@ const syncMachineSpares = async (machineId, spareIds) => {
             }
         })));
     }
+
+    await MachineSpare.deleteMany({
+        machine: machineId,
+        spare: { $nin: spareIds }
+    });
 };
+
+const serializeMachine = (machine, spareCount) => ({
+    ...machine.toObject(),
+    spareCount
+});
+
+const countMachineSpares = async (machineId) =>
+    (await MachineSpare.distinct("spare", { machine: machineId })).length;
 
 // POST - Add Machine
 exports.createMachine = async (req, res) => {
@@ -81,7 +89,7 @@ exports.createMachine = async (req, res) => {
         res.status(201).json({
             success: true,
             message: "Machine added successfully",
-            data: machine
+            data: serializeMachine(machine, await countMachineSpares(machine._id))
         });
 
     } catch (error) {
@@ -98,12 +106,35 @@ exports.createMachine = async (req, res) => {
 // GET - Get All Machines
 exports.getAllMachines = async (req, res) => {
     try {
-        const machines = await Machine.find().sort({ createdAt: -1 });
+        const machines = await Machine.find()
+            .sort({ createdAt: -1, _id: -1 });
+        const spareCounts = await MachineSpare.aggregate([
+            {
+                $group: {
+                    _id: {
+                        machine: "$machine",
+                        spare: "$spare"
+                    }
+                }
+            },
+            {
+                $group: {
+                    _id: "$_id.machine",
+                    count: { $sum: 1 }
+                }
+            }
+        ]);
+        const countByMachine = new Map(
+            spareCounts.map(({ _id, count }) => [String(_id), count])
+        );
+        const data = machines.map((machine) =>
+            serializeMachine(machine, countByMachine.get(String(machine._id)) || 0)
+        );
 
         res.status(200).json({
             success: true,
-            count: machines.length,
-            data: machines
+            count: data.length,
+            data
         });
 
     } catch (error) {
@@ -129,7 +160,7 @@ exports.getMachineById = async (req, res) => {
 
         res.status(200).json({
             success: true,
-            data: machine
+            data: serializeMachine(machine, await countMachineSpares(machine._id))
         });
 
     } catch (error) {
@@ -196,7 +227,7 @@ exports.updateMachine = async (req, res) => {
         res.status(200).json({
             success: true,
             message: "Machine updated successfully",
-            data: machine
+            data: serializeMachine(machine, await countMachineSpares(machine._id))
         });
 
     } catch (error) {
@@ -213,7 +244,7 @@ exports.updateMachine = async (req, res) => {
 // DELETE - Delete Machine
 exports.deleteMachine = async (req, res) => {
     try {
-        const machine = await Machine.findByIdAndDelete(req.params.id);
+        const machine = await Machine.findById(req.params.id);
 
         if (!machine) {
             return res.status(404).json({
@@ -221,6 +252,9 @@ exports.deleteMachine = async (req, res) => {
                 message: "Machine not found"
             });
         }
+
+        await MachineSpare.deleteMany({ machine: machine._id });
+        await machine.deleteOne();
 
         res.status(200).json({
             success: true,

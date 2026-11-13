@@ -11,6 +11,44 @@ const asyncHandler = require('../utils/asyncHandler');
 
 const getMachineModel = () => mongoose.model('Machine');
 
+const validateMachineIds = async (machineIds) => {
+    if (!Array.isArray(machineIds)) {
+        return { error: 'Machine IDs must be provided as a list' };
+    }
+
+    const uniqueIds = [...new Set(machineIds.map(String))];
+    if (uniqueIds.some((id) => !mongoose.isValidObjectId(id))) {
+        return { error: 'One or more selected machines are invalid' };
+    }
+
+    const Machine = getMachineModel();
+    const existingMachines = await Machine.countDocuments({
+        _id: { $in: uniqueIds }
+    });
+    if (existingMachines !== uniqueIds.length) {
+        return { error: 'One or more selected machines no longer exist' };
+    }
+
+    return { machineIds: uniqueIds };
+};
+
+const syncSpareMachines = async (spareId, machineIds) => {
+    if (machineIds.length) {
+        await MachineSpare.bulkWrite(machineIds.map((machineId) => ({
+            updateOne: {
+                filter: { machine: machineId, spare: spareId },
+                update: { $setOnInsert: { requiredQty: 1 } },
+                upsert: true
+            }
+        })));
+    }
+
+    await MachineSpare.deleteMany({
+        spare: spareId,
+        machine: { $nin: machineIds }
+    });
+};
+
 // 1. CREATE SPARE
 
 exports.createSpare = asyncHandler(async (req, res) => {
@@ -21,14 +59,18 @@ exports.createSpare = asyncHandler(async (req, res) => {
         description,
         category,
         unit,
-        stock = 0,
-        minStock = 0,
-        maxStock = 0,
+        stock,
+        minStock,
+        maxStock,
         location,
         supplier,
         unitCost,
         machineIds = []
     } = req.body;
+
+    const initialStock = stock === undefined ? 0 : Number(stock);
+    const initialMinStock = minStock === undefined ? 0 : Number(minStock);
+    const initialMaxStock = maxStock === undefined ? 10 : Number(maxStock);
 
     if (!code || !name) {
         return res.status(400).json({
@@ -40,10 +82,11 @@ exports.createSpare = asyncHandler(async (req, res) => {
     const cleanCode = String(code).trim().toUpperCase();
     const cleanName = String(name).trim();
 
-    if (Number(maxStock) < Number(minStock)) {
+    const validatedMachines = await validateMachineIds(machineIds);
+    if (validatedMachines.error) {
         return res.status(400).json({
             success: false,
-            message: 'Maximum stock must be greater than or equal to minimum stock'
+            message: validatedMachines.error
         });
     }
 
@@ -51,6 +94,19 @@ exports.createSpare = asyncHandler(async (req, res) => {
     const existing = await Spare.findOne({ code: cleanCode });
     if (existing) {
         if (!existing.isActive) {
+            const nextMinStock = minStock === undefined
+                ? existing.minStock
+                : initialMinStock;
+            const nextMaxStock = maxStock === undefined
+                ? existing.maxStock
+                : initialMaxStock;
+            if (nextMaxStock < nextMinStock) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'Maximum stock must be greater than or equal to minimum stock'
+                });
+            }
+
             // It was previously soft-deleted or deactivated: Reactivate it with the new info!
             existing.isActive = true;
             existing.name = cleanName;
@@ -59,46 +115,49 @@ exports.createSpare = asyncHandler(async (req, res) => {
             existing.description = description || existing.description;
             existing.category = category || existing.category;
             existing.unit = unit || existing.unit;
-            existing.stock = Number(stock) || existing.stock;
-            existing.minStock = Number(minStock) || existing.minStock;
-            existing.maxStock = Number(maxStock) || existing.maxStock;
+            const previousStock = existing.stock;
+            if (stock !== undefined) existing.stock = initialStock;
+            if (minStock !== undefined) existing.minStock = initialMinStock;
+            if (maxStock !== undefined) existing.maxStock = initialMaxStock;
             existing.location = location || existing.location;
             existing.supplier = supplier || existing.supplier;
-            existing.unitCost = Number(unitCost) || existing.unitCost;
+            if (unitCost !== undefined) existing.unitCost = Number(unitCost);
             existing.updatedBy = req.user?._id;
             await existing.save();
 
-            // Sync machine mappings
-            if (Array.isArray(machineIds) && machineIds.length > 0) {
-                await MachineSpare.deleteMany({ spare: existing._id });
-                for (const mId of machineIds) {
-                    if (mongoose.isValidObjectId(mId)) {
-                        await MachineSpare.create({
-                            machine: mId,
-                            spare: existing._id,
-                            requiredQty: 1
-                        }).catch(() => {});
-                    }
-                }
+            if (Object.prototype.hasOwnProperty.call(req.body, 'machineIds')) {
+                await syncSpareMachines(existing._id, validatedMachines.machineIds);
             }
 
-            if (Number(stock) > 0) {
-                await StockTransaction.create([{
+            if (stock !== undefined && initialStock !== previousStock) {
+                await StockTransaction.create({
                     spare: existing._id,
-                    type: 'IN',
-                    quantity: Number(stock),
-                    balanceAfter: Number(stock),
-                    reason: 'Opening stock (reactivated)',
+                    type: initialStock > previousStock ? 'IN' : 'OUT',
+                    quantity: Math.abs(initialStock - previousStock),
+                    balanceAfter: initialStock,
+                    reason: 'Stock adjusted on reactivation',
                     referenceType: 'MANUAL',
                     performedByName: req.user?.name || 'Admin',
                     transactionAt: new Date()
-                }]).catch(() => {});
+                });
+            }
+
+            if (initialMaxStock < initialMinStock) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'Maximum stock must be greater than or equal to minimum stock'
+                });
             }
 
             return res.status(200).json({
                 success: true,
                 message: `Spare part "${cleanCode}" reactivated and updated successfully`,
-                data: existing
+                data: {
+                    ...existing.toJSON(),
+                    machines: await MachineSpare.find({ spare: existing._id })
+                        .populate('machine', 'code name location')
+                        .lean()
+                }
             });
         }
 
@@ -116,9 +175,9 @@ exports.createSpare = asyncHandler(async (req, res) => {
         description,
         category,
         unit,
-        stock: Number(stock) || 0,
-        minStock: Number(minStock) || 0,
-        maxStock: Number(maxStock) || 10,
+        stock: initialStock,
+        minStock: initialMinStock,
+        maxStock: initialMaxStock,
         location,
         supplier,
         unitCost,
@@ -152,31 +211,20 @@ exports.createSpare = asyncHandler(async (req, res) => {
         }
     }
 
-    // Create machine mappings if passed
-    if (Array.isArray(machineIds) && machineIds.length > 0) {
-        for (const mId of machineIds) {
-            if (mongoose.isValidObjectId(mId)) {
-                await MachineSpare.create({
-                    machine: mId,
-                    spare: spare._id,
-                    requiredQty: 1
-                }).catch(() => {});
-            }
-        }
-    }
+    await syncSpareMachines(spare._id, validatedMachines.machineIds);
 
     // Record opening stock transaction
-    if (Number(stock) > 0) {
-        await StockTransaction.create([{
+    if (initialStock > 0) {
+        await StockTransaction.create({
             spare: spare._id,
             type: 'IN',
-            quantity: Number(stock),
-            balanceAfter: Number(stock),
+            quantity: initialStock,
+            balanceAfter: initialStock,
             reason: 'Opening stock',
             referenceType: 'MANUAL',
             performedByName: req.user?.name || 'Admin',
             transactionAt: new Date()
-        }]).catch(() => {});
+        });
     }
 
     res.status(201).json({
@@ -188,6 +236,8 @@ exports.createSpare = asyncHandler(async (req, res) => {
 
 
 async function seedInitialDataIfEmpty() {
+    return;
+
     try {
         const shouldSeedDemoData = process.env.SEED_DEMO_DATA === 'true';
         if (!shouldSeedDemoData) return;
@@ -342,8 +392,6 @@ async function seedInitialDataIfEmpty() {
 // 2. GET ALL SPARES
 
 exports.getSpares = asyncHandler(async (req, res) => {
-    await seedInitialDataIfEmpty();
-
     const {
         search,
         status,
@@ -355,21 +403,45 @@ exports.getSpares = asyncHandler(async (req, res) => {
 
     const filter = {};
 
+    if (search !== undefined && typeof search !== 'string') {
+        return res.status(400).json({
+            success: false,
+            message: 'Search must be a string'
+        });
+    }
+
+    if (!['true', 'false', 'all'].includes(active)) {
+        return res.status(400).json({
+            success: false,
+            message: 'Active filter must be true, false, or all'
+        });
+    }
+
+    if (status && !['Out', 'Low', 'OK'].includes(status)) {
+        return res.status(400).json({
+            success: false,
+            message: 'Status filter must be Out, Low, or OK'
+        });
+    }
+
     if (active !== 'all') {
         filter.isActive = active !== 'false';
     }
 
     if (search) {
 
+        const escapedSearch = search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
         filter.$or = [
-            { code: { $regex: search, $options: 'i' } },
-            { name: { $regex: search, $options: 'i' } },
-            { description: { $regex: search, $options: 'i' } }
+            { code: { $regex: escapedSearch, $options: 'i' } },
+            { name: { $regex: escapedSearch, $options: 'i' } },
+            { description: { $regex: escapedSearch, $options: 'i' } }
         ];
     }
 
     if (status === 'Out') {
-        filter.stock = 0;
+        filter.$expr = {
+            $lte: ['$stock', 0]
+        };
     }
 
     if (status === 'Low') {
@@ -388,6 +460,12 @@ exports.getSpares = asyncHandler(async (req, res) => {
     }
 
     if (machineId) {
+        if (!mongoose.isValidObjectId(machineId)) {
+            return res.status(400).json({
+                success: false,
+                message: 'Invalid machine ID'
+            });
+        }
 
         const mappings = await MachineSpare.find({
             machine: machineId
@@ -398,13 +476,21 @@ exports.getSpares = asyncHandler(async (req, res) => {
         };
     }
 
-    const pageNum = Math.max(1, Number(page));
-    const pageSize = Math.min(200, Math.max(1, Number(limit)));
+    const pageNum = Number(page);
+    const requestedPageSize = Number(limit);
+    if (!Number.isInteger(pageNum) || pageNum < 1 ||
+        !Number.isInteger(requestedPageSize) || requestedPageSize < 1) {
+        return res.status(400).json({
+            success: false,
+            message: 'Page and limit must be positive whole numbers'
+        });
+    }
+    const pageSize = Math.min(200, requestedPageSize);
 
     const [items, total] = await Promise.all([
 
         Spare.find(filter)
-            .sort({ name: 1 })
+            .sort({ name: 1, _id: 1 })
             .skip((pageNum - 1) * pageSize)
             .limit(pageSize)
             .lean(),
@@ -415,26 +501,54 @@ exports.getSpares = asyncHandler(async (req, res) => {
 
     const ids = items.map(item => item._id);
 
-    const mappings = await MachineSpare.find({
-        spare: { $in: ids }
-    })
-        .populate('machine', 'code name location')
-        .lean();
+    const [mappings, latestTransactions] = await Promise.all([
+        MachineSpare.find({
+            spare: { $in: ids }
+        })
+            .populate('machine', 'code name location')
+            .lean(),
+        StockTransaction.aggregate([
+            { $match: { spare: { $in: ids }, type: { $in: ['IN', 'OUT'] } } },
+            { $sort: { transactionAt: -1, _id: -1 } },
+            {
+                $group: {
+                    _id: { spare: '$spare', type: '$type' },
+                    transactionAt: { $first: '$transactionAt' }
+                }
+            }
+        ])
+    ]);
 
     const mappingBySpare = new Map();
 
     mappings.forEach(mapping => {
+        if (!mapping.machine) return;
 
         const key = String(mapping.spare);
 
         if (!mappingBySpare.has(key)) {
-            mappingBySpare.set(key, []);
+            mappingBySpare.set(key, new Map());
         }
 
-        mappingBySpare.get(key).push({
+        mappingBySpare.get(key).set(String(mapping.machine._id), {
             machine: mapping.machine,
             requiredQty: mapping.requiredQty
         });
+    });
+
+    const latestBySpare = new Map();
+    latestTransactions.forEach(transaction => {
+        const spareId = String(transaction._id.spare);
+        const dates = latestBySpare.get(spareId) || {
+            lastUsed: null,
+            lastRestocked: null
+        };
+        if (transaction._id.type === 'OUT') {
+            dates.lastUsed = transaction.transactionAt;
+        } else {
+            dates.lastRestocked = transaction.transactionAt;
+        }
+        latestBySpare.set(spareId, dates);
     });
 
     const data = items.map(spare => ({
@@ -442,10 +556,17 @@ exports.getSpares = asyncHandler(async (req, res) => {
         ...spare,
 
         stockStatus:
+            !Number.isFinite(spare.stock) || !Number.isFinite(spare.minStock) ? 'Unknown' :
             spare.stock <= 0 ? 'Out' :
             spare.stock <= spare.minStock ? 'Low' : 'OK',
 
-        machines: mappingBySpare.get(String(spare._id)) || []
+        machines: Array.from(
+            (mappingBySpare.get(String(spare._id)) || new Map()).values()
+        ),
+        ...(latestBySpare.get(String(spare._id)) || {
+            lastUsed: null,
+            lastRestocked: null
+        })
 
     }));
 
@@ -508,6 +629,7 @@ exports.updateSpare = asyncHandler(async (req, res) => {
     ];
 
     const updates = {};
+    let selectedMachineIds;
 
     allowed.forEach(key => {
         if (req.body[key] !== undefined) {
@@ -522,6 +644,17 @@ exports.updateSpare = asyncHandler(async (req, res) => {
             success: false,
             message: 'Spare not found'
         });
+    }
+
+    if (Object.prototype.hasOwnProperty.call(req.body, 'machineIds')) {
+        const validatedMachines = await validateMachineIds(req.body.machineIds);
+        if (validatedMachines.error) {
+            return res.status(400).json({
+                success: false,
+                message: validatedMachines.error
+            });
+        }
+        selectedMachineIds = validatedMachines.machineIds;
     }
 
     // Check code collision if code is updated
@@ -555,20 +688,6 @@ exports.updateSpare = asyncHandler(async (req, res) => {
         });
     }
 
-    // Sync machine mappings if provided
-    if (Array.isArray(req.body.machineIds)) {
-        await MachineSpare.deleteMany({ spare: spare._id });
-        for (const mId of req.body.machineIds) {
-            if (mongoose.isValidObjectId(mId)) {
-                await MachineSpare.create({
-                    machine: mId,
-                    spare: spare._id,
-                    requiredQty: 1
-                }).catch(() => {});
-            }
-        }
-    }
-
     Object.assign(updates, {
         updatedBy: req.user?._id || null
     });
@@ -576,6 +695,10 @@ exports.updateSpare = asyncHandler(async (req, res) => {
     Object.assign(spare, updates);
 
     await spare.save();
+
+    if (selectedMachineIds) {
+        await syncSpareMachines(spare._id, selectedMachineIds);
+    }
 
     // Fetch refreshed mappings
     const mappings = await MachineSpare.find({ spare: spare._id })
@@ -720,11 +843,19 @@ exports.getMachineSpares = asyncHandler(async (req, res) => {
     }).populate(
         'spare',
         'code name stock minStock maxStock unit isActive'
-    );
+    ).sort({ _id: 1 });
+    const seenSpares = new Set();
+    const uniqueMappings = mappings.filter(mapping => {
+        if (!mapping.spare) return false;
+        const spareId = String(mapping.spare._id);
+        if (seenSpares.has(spareId)) return false;
+        seenSpares.add(spareId);
+        return true;
+    });
 
     res.json({
         success: true,
-        data: mappings
+        data: uniqueMappings
     });
 });
 
@@ -891,27 +1022,63 @@ exports.getLedger = asyncHandler(async (req, res) => {
 
     const filter = {};
 
-    if (spareId) filter.spare = spareId;
-    if (type) filter.type = type;
+    if (spareId) {
+        if (!mongoose.isValidObjectId(spareId)) {
+            return res.status(400).json({
+                success: false,
+                message: 'Invalid spare ID'
+            });
+        }
+        filter.spare = spareId;
+    }
+
+    if (type) {
+        if (!['IN', 'OUT'].includes(type)) {
+            return res.status(400).json({
+                success: false,
+                message: 'Transaction type must be IN or OUT'
+            });
+        }
+        filter.type = type;
+    }
 
     if (from || to) {
 
         filter.transactionAt = {};
 
-        if (from) filter.transactionAt.$gte = new Date(from);
-        if (to) filter.transactionAt.$lte = new Date(to);
+        const fromDate = from ? new Date(from) : null;
+        const toDate = to ? new Date(to) : null;
+        if ((fromDate && Number.isNaN(fromDate.getTime())) ||
+            (toDate && Number.isNaN(toDate.getTime())) ||
+            (fromDate && toDate && fromDate > toDate)) {
+            return res.status(400).json({
+                success: false,
+                message: 'Transaction date range is invalid'
+            });
+        }
+
+        if (fromDate) filter.transactionAt.$gte = fromDate;
+        if (toDate) filter.transactionAt.$lte = toDate;
 
     }
 
-    const pageNum = Math.max(1, Number(page));
-    const pageSize = Math.min(500, Math.max(1, Number(limit)));
+    const pageNum = Number(page);
+    const requestedPageSize = Number(limit);
+    if (!Number.isInteger(pageNum) || pageNum < 1 ||
+        !Number.isInteger(requestedPageSize) || requestedPageSize < 1) {
+        return res.status(400).json({
+            success: false,
+            message: 'Page and limit must be positive whole numbers'
+        });
+    }
+    const pageSize = Math.min(500, requestedPageSize);
 
     const [data, total] = await Promise.all([
 
         StockTransaction.find(filter)
             .populate('spare', 'code name unit')
             .populate('machine', 'code name')
-            .sort({ transactionAt: -1 })
+            .sort({ transactionAt: -1, _id: -1 })
             .skip((pageNum - 1) * pageSize)
             .limit(pageSize),
 
@@ -1216,10 +1383,9 @@ exports.getMaintenanceHistory = asyncHandler(async (req, res) => {
 // 16. SPARE DASHBOARD SUMMARY
 
 exports.getSpareSummary = asyncHandler(async (req, res) => {
-    await seedInitialDataIfEmpty();
-
     const [
         total,
+        inStock,
         low,
         out,
         alerts,
@@ -1227,6 +1393,13 @@ exports.getSpareSummary = asyncHandler(async (req, res) => {
     ] = await Promise.all([
 
         Spare.countDocuments({ isActive: true }),
+
+        Spare.countDocuments({
+            isActive: true,
+            $expr: {
+                $gt: ['$stock', '$minStock']
+            }
+        }),
 
         Spare.countDocuments({
             isActive: true,
@@ -1240,7 +1413,9 @@ exports.getSpareSummary = asyncHandler(async (req, res) => {
 
         Spare.countDocuments({
             isActive: true,
-            stock: 0
+            $expr: {
+                $lte: ['$stock', 0]
+            }
         }),
 
         StockAlert.countDocuments({
@@ -1249,7 +1424,7 @@ exports.getSpareSummary = asyncHandler(async (req, res) => {
 
         StockTransaction.find()
             .populate('spare', 'code name')
-            .sort({ transactionAt: -1 })
+            .sort({ transactionAt: -1, _id: -1 })
             .limit(10)
 
     ]);
@@ -1260,7 +1435,7 @@ exports.getSpareSummary = asyncHandler(async (req, res) => {
         data: {
             totalParts: total,
             totalSpares: total,
-            inStock: Math.max(0, total - low - out),
+            inStock,
             lowStock: low,
             outOfStock: out,
             openAlerts: alerts,
